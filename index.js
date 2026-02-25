@@ -16,21 +16,33 @@
 
 const SYSTEM_PROMPT = `You are the admin assistant for the Sweeney family website at family.sweeneychris.com.
 
-Your job is to help build and manage pages for this family site. When asked to build something:
+Your job is to help build and manage pages for this family site. You operate in two modes:
 
-1. Generate a COMPLETE, self-contained HTML page (HTML + CSS + JS in one file)
-2. Use this consistent style: font-family -apple-system/sans-serif, background #F5F0E8, 
-   color #2C2C2C, accent #2E6B8A, cards with white background and border-radius 12px
-3. Always include a "← Dashboard" link back to /
-4. Make it mobile-responsive
-5. Include sample/placeholder data so the preview looks realistic
+## EDIT MODE (when context.mode is "edit")
+The user is editing an existing page. You will receive the current HTML source.
+- Make TARGETED edits to the existing code — don't regenerate the whole page
+- Preserve the existing structure, styles, and content unless asked to change them
+- Always keep the edit widget script: <script src="/shared/edit-widget.js"></script>
+- Always keep the "← Dashboard" link
+- Return the COMPLETE updated HTML (not a diff)
 
-The site structure:
+## BUILD MODE (no context, or building from scratch)
+Generate a COMPLETE, self-contained HTML page (HTML + CSS + JS in one file).
+- Use consistent style: font-family -apple-system/sans-serif, background #F5F0E8, 
+  color #2C2C2C, accent #2E6B8A, cards with white bg and border-radius 12px
+- Always include a "← Dashboard" link back to /
+- Always include: <script src="/shared/edit-widget.js"></script> before </body>
+- Make it mobile-responsive
+- Include sample/placeholder data so the preview looks realistic
+
+## SITE STRUCTURE
 - / — Family Dashboard (main hub)
 - /recipes — Recipe collection
 - /camp — Summer camp tracker
-- /admin — This admin panel (don't modify)
+- /admin — Admin panel (don't modify)
+- /shared/edit-widget.js — Edit button script (include on every page)
 
+## RESPONSE FORMAT
 Respond with JSON in this exact format:
 {
   "message": "Your conversational response to the user",
@@ -46,7 +58,7 @@ If no page is being generated (just conversation), omit the "page" field:
   "message": "Your response here"
 }
 
-Keep messages concise and friendly. This is a family tool, not a corporate product.`;
+Keep messages concise and friendly.`;
 
 export default {
   async fetch(request, env) {
@@ -66,13 +78,20 @@ export default {
     // POST /api/chat — Send message to Claude, get response + optional generated page
     if (url.pathname === '/api/chat' && request.method === 'POST') {
       try {
-        const { message, history = [] } = await request.json();
+        const { message, history = [], context = null } = await request.json();
 
         // Build messages array with conversation history
         const messages = [
           ...history.map(h => ({ role: h.role, content: h.content })),
-          { role: 'user', content: message }
         ];
+
+        // If we have edit context, prepend it to the user message
+        let userContent = message;
+        if (context && context.mode === 'edit' && context.currentSource) {
+          userContent = `[EDITING PAGE: ${context.path}]\n[CURRENT HTML SOURCE]:\n${context.currentSource}\n\n[USER REQUEST]: ${message}`;
+        }
+
+        messages.push({ role: 'user', content: userContent });
 
         // Call Claude API
         const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -84,7 +103,7 @@ export default {
           },
           body: JSON.stringify({
             model: 'claude-sonnet-4-20250514',
-            max_tokens: 4096,
+            max_tokens: 8192,
             system: SYSTEM_PROMPT,
             messages,
           }),
@@ -96,7 +115,6 @@ export default {
         // Parse the JSON response from Claude
         let parsed;
         try {
-          // Try to extract JSON from the response (Claude might wrap it in markdown)
           const jsonMatch = responseText.match(/\{[\s\S]*\}/);
           parsed = JSON.parse(jsonMatch ? jsonMatch[0] : responseText);
         } catch {
@@ -104,6 +122,61 @@ export default {
         }
 
         return new Response(JSON.stringify(parsed), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+    }
+
+    // GET /api/page-source — Fetch current HTML source of a page from GitHub
+    if (url.pathname === '/api/page-source' && request.method === 'GET') {
+      try {
+        const pagePath = url.searchParams.get('path') || '/';
+        const owner = env.GITHUB_REPO_OWNER;
+        const repo = env.GITHUB_REPO_NAME;
+
+        // Map URL path to file path in repo
+        let filePath;
+        const cleanPath = pagePath.replace(/^\//, '').replace(/\/$/, '');
+        if (cleanPath === '' || cleanPath === '/') {
+          filePath = 'dashboard/index.html';
+        } else {
+          filePath = `dashboard/${cleanPath}/index.html`;
+        }
+
+        const res = await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=main`,
+          {
+            headers: {
+              'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+              'User-Agent': 'sweeneychris-admin',
+              'Accept': 'application/vnd.github.v3+json',
+            },
+          }
+        );
+
+        if (!res.ok) {
+          return new Response(JSON.stringify({ error: 'Page not found', path: filePath }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
+
+        const data = await res.json();
+        // GitHub returns base64-encoded content
+        const html = decodeURIComponent(escape(atob(data.content)));
+
+        return new Response(JSON.stringify({
+          html,
+          path: pagePath,
+          filePath,
+          sha: data.sha,
+        }), {
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
 
