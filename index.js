@@ -166,7 +166,7 @@ async function handleChat(request, env, corsHeaders) {
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-6-20250514',
+          model: 'claude-sonnet-4-6',
           max_tokens: 16384,
           stream: true,
           thinking: { type: 'adaptive' },
