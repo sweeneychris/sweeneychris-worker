@@ -1,36 +1,25 @@
 /**
- * Sweeney Family Admin — Cloudflare Worker Backend v4
+ * Sweeney Family Admin — Cloudflare Worker Backend v5
  *
- * Key fix: Claude returns message + HTML separately using XML delimiters
- * instead of trying to embed HTML inside JSON (which breaks constantly).
+ * Uses Claude tool use (generate_page) for structured page generation
+ * instead of XML parsing. More reliable — HTML is JSON-escaped by the API.
  */
 
 const SYSTEM_PROMPT = `You are the admin assistant for the Sweeney family website at family.sweeneychris.com.
 
-## RESPONSE FORMAT — CRITICAL
-Always respond using these XML tags. Do NOT use JSON.
-
-For conversation only (no page changes):
-<message>Your friendly response here</message>
-
-For generating or editing a page:
-<message>Your friendly response describing what you did</message>
-<page path="/target-path">
-<!DOCTYPE html>
-<html>
-...complete HTML here...
-</html>
-</page>
+## HOW TO RESPOND
+- For conversation (no page changes): just reply with text.
+- To create or edit a page: reply with a brief message explaining what you did, then call the generate_page tool with the complete HTML.
 
 ## EDIT MODE (when you receive [EDITING PAGE])
 You will receive the current HTML source. Make TARGETED edits:
 - Preserve existing structure, styles, and content unless asked to change them
 - Always keep: <script src="/shared/edit-widget.js"></script>
 - Always keep the "← Dashboard" link
-- Return the COMPLETE updated HTML
+- Return the COMPLETE updated HTML via the generate_page tool
 
 ## BUILD MODE
-Generate a COMPLETE, self-contained HTML page (HTML + CSS + JS in one file).
+Generate a COMPLETE, self-contained HTML page (HTML + CSS + JS in one file) via the generate_page tool.
 - Style: font-family -apple-system/sans-serif, background #F5F0E8, color #2C2C2C, accent #2E6B8A
 - Cards: white background, border-radius 12px
 - Always include a "← Dashboard" link back to /
@@ -45,6 +34,27 @@ Generate a COMPLETE, self-contained HTML page (HTML + CSS + JS in one file).
 - /admin — Admin panel (don't modify)
 
 Keep messages concise and friendly.`;
+
+const TOOLS = [
+  {
+    name: 'generate_page',
+    description: 'Generate or update a complete HTML page for the family website. Use this whenever you need to create a new page or modify an existing one. Always provide a complete, self-contained HTML document.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'The URL path for the page, e.g. "/recipes", "/camp", "/"',
+        },
+        html: {
+          type: 'string',
+          description: 'The complete HTML document including <!DOCTYPE html>, all CSS, JS, and content',
+        },
+      },
+      required: ['path', 'html'],
+    },
+  },
+];
 
 const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/calendar.readonly',
@@ -124,7 +134,7 @@ async function getGoogleAccessToken(userKey, env) {
 }
 
 // ============================================================
-// POST /api/chat — Uses XML delimiters instead of JSON for reliability
+// POST /api/chat — Uses Claude tool use for structured page generation
 // ============================================================
 async function handleChat(request, env, corsHeaders) {
   const { message, history = [], context = null } = await request.json();
@@ -137,7 +147,6 @@ async function handleChat(request, env, corsHeaders) {
   }
   messages.push({ role: 'user', content: userContent });
 
-  // Create a readable stream to pipe back to the client
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -147,7 +156,6 @@ async function handleChat(request, env, corsHeaders) {
     writer.write(encoder.encode(payload));
   }
 
-  // Process Claude's stream in the background
   const streamPromise = (async () => {
     try {
       const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -158,10 +166,12 @@ async function handleChat(request, env, corsHeaders) {
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
+          model: 'claude-sonnet-4-6-20250514',
           max_tokens: 16384,
           stream: true,
+          thinking: { type: 'adaptive' },
           system: SYSTEM_PROMPT,
+          tools: TOOLS,
           messages,
         }),
       });
@@ -175,9 +185,10 @@ async function handleChat(request, env, corsHeaders) {
 
       const reader = claudeRes.body.getReader();
       const decoder = new TextDecoder();
-      let fullText = '';
-      let inPageTag = false;
+      let fullMessageText = '';
+      let toolCalls = [];
       let sentPageStatus = false;
+      let sentThinkingStatus = false;
       let buffer = '';
 
       while (true) {
@@ -186,9 +197,8 @@ async function handleChat(request, env, corsHeaders) {
 
         buffer += decoder.decode(value, { stream: true });
 
-        // Process SSE lines from Claude
         const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+        buffer = lines.pop() || '';
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
@@ -198,27 +208,34 @@ async function handleChat(request, env, corsHeaders) {
           try {
             const event = JSON.parse(data);
 
-            if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-              const text = event.delta.text;
-              fullText += text;
-
-              // Detect when we enter a <page> tag
-              if (!inPageTag && fullText.includes('<page')) {
-                inPageTag = true;
-                if (!sentPageStatus) {
-                  sendEvent('status', { text: 'Building page...' });
-                  sentPageStatus = true;
-                }
+            // Thinking block started — show status
+            if (event.type === 'content_block_start' && event.content_block?.type === 'thinking') {
+              if (!sentThinkingStatus) {
+                sendEvent('status', { text: 'Thinking...' });
+                sentThinkingStatus = true;
               }
+            }
 
-              // Only stream visible message text (before <page> tag or inside <message> tags)
-              if (!inPageTag) {
-                // Strip <message> tags for display
-                const cleanText = text.replace(/<\/?message>/g, '');
-                if (cleanText) {
-                  sendEvent('text', { text: cleanText });
-                }
+            // Tool use block started — buffer its JSON input
+            if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+              toolCalls.push({ name: event.content_block.name, input_json: '' });
+              if (!sentPageStatus) {
+                sendEvent('status', { text: 'Building page...' });
+                sentPageStatus = true;
               }
+            }
+
+            if (event.type === 'content_block_delta') {
+              if (event.delta?.type === 'text_delta') {
+                // Stream message text to the client in real-time
+                fullMessageText += event.delta.text;
+                sendEvent('text', { text: event.delta.text });
+              } else if (event.delta?.type === 'input_json_delta') {
+                // Buffer tool input JSON (not streamed to client)
+                const lastTool = toolCalls[toolCalls.length - 1];
+                if (lastTool) lastTool.input_json += event.delta.partial_json;
+              }
+              // thinking_delta is intentionally ignored — not shown to client
             }
           } catch {
             // Skip unparseable lines
@@ -226,20 +243,19 @@ async function handleChat(request, env, corsHeaders) {
         }
       }
 
-      // Parse the final complete response
-      const result = { message: '', page: null };
+      // Build final result from text + tool calls
+      const result = { message: fullMessageText.trim(), page: null };
 
-      const msgMatch = fullText.match(/<message>([\s\S]*?)<\/message>/);
-      if (msgMatch) {
-        result.message = msgMatch[1].trim();
-      } else {
-        const pageStart = fullText.indexOf('<page');
-        result.message = pageStart > 0 ? fullText.substring(0, pageStart).trim() : fullText.trim();
+      const pageCall = toolCalls.find(t => t.name === 'generate_page');
+      if (pageCall) {
+        try {
+          const input = JSON.parse(pageCall.input_json);
+          result.page = { path: input.path, html: input.html };
+        } catch {}
       }
 
-      const pageMatch = fullText.match(/<page\s+path="([^"]*)">([\s\S]*?)<\/page>/);
-      if (pageMatch) {
-        result.page = { path: pageMatch[1], html: pageMatch[2].trim() };
+      if (!result.message && result.page) {
+        result.message = "Here's the updated page:";
       }
 
       sendEvent('done', result);
