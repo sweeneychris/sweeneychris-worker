@@ -1,6 +1,6 @@
 /**
  * Sweeney Family Admin — Cloudflare Worker Backend v4
- * 
+ *
  * Key fix: Claude returns message + HTML separately using XML delimiters
  * instead of trying to embed HTML inside JSON (which breaks constantly).
  */
@@ -137,51 +137,128 @@ async function handleChat(request, env, corsHeaders) {
   }
   messages.push({ role: 'user', content: userContent });
 
-  const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 16384,
-      system: SYSTEM_PROMPT,
-      messages,
-    }),
-  });
+  // Create a readable stream to pipe back to the client
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
 
-  const claudeData = await claudeRes.json();
-  const responseText = claudeData.content?.[0]?.text || '';
+  function sendEvent(event, data) {
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    writer.write(encoder.encode(payload));
+  }
 
-  // Parse XML-style response
-  const result = { message: '', page: null };
+  // Process Claude's stream in the background
+  const streamPromise = (async () => {
+    try {
+      const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 16384,
+          stream: true,
+          system: SYSTEM_PROMPT,
+          messages,
+        }),
+      });
 
-  // Extract message
-  const msgMatch = responseText.match(/<message>([\s\S]*?)<\/message>/);
-  if (msgMatch) {
-    result.message = msgMatch[1].trim();
-  } else {
-    // Fallback: treat everything before <page> as the message, or the whole thing
-    const pageStart = responseText.indexOf('<page');
-    if (pageStart > 0) {
-      result.message = responseText.substring(0, pageStart).trim();
-    } else {
-      result.message = responseText.trim();
+      if (!claudeRes.ok) {
+        const err = await claudeRes.text();
+        sendEvent('error', { message: `Claude API error: ${claudeRes.status}` });
+        writer.close();
+        return;
+      }
+
+      const reader = claudeRes.body.getReader();
+      const decoder = new TextDecoder();
+      let fullText = '';
+      let inPageTag = false;
+      let sentPageStatus = false;
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process SSE lines from Claude
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+
+          try {
+            const event = JSON.parse(data);
+
+            if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+              const text = event.delta.text;
+              fullText += text;
+
+              // Detect when we enter a <page> tag
+              if (!inPageTag && fullText.includes('<page')) {
+                inPageTag = true;
+                if (!sentPageStatus) {
+                  sendEvent('status', { text: 'Building page...' });
+                  sentPageStatus = true;
+                }
+              }
+
+              // Only stream visible message text (before <page> tag or inside <message> tags)
+              if (!inPageTag) {
+                // Strip <message> tags for display
+                const cleanText = text.replace(/<\/?message>/g, '');
+                if (cleanText) {
+                  sendEvent('text', { text: cleanText });
+                }
+              }
+            }
+          } catch {
+            // Skip unparseable lines
+          }
+        }
+      }
+
+      // Parse the final complete response
+      const result = { message: '', page: null };
+
+      const msgMatch = fullText.match(/<message>([\s\S]*?)<\/message>/);
+      if (msgMatch) {
+        result.message = msgMatch[1].trim();
+      } else {
+        const pageStart = fullText.indexOf('<page');
+        result.message = pageStart > 0 ? fullText.substring(0, pageStart).trim() : fullText.trim();
+      }
+
+      const pageMatch = fullText.match(/<page\s+path="([^"]*)">([\s\S]*?)<\/page>/);
+      if (pageMatch) {
+        result.page = { path: pageMatch[1], html: pageMatch[2].trim() };
+      }
+
+      sendEvent('done', result);
+
+    } catch (err) {
+      sendEvent('error', { message: err.message });
+    } finally {
+      writer.close();
     }
-  }
+  })();
 
-  // Extract page HTML
-  const pageMatch = responseText.match(/<page\s+path="([^"]*)">([\s\S]*?)<\/page>/);
-  if (pageMatch) {
-    result.page = {
-      path: pageMatch[1],
-      html: pageMatch[2].trim(),
-    };
-  }
-
-  return json(result, 200, corsHeaders);
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      ...corsHeaders,
+    },
+  });
 }
 
 // ============================================================
