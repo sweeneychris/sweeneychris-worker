@@ -1,32 +1,25 @@
 /**
- * Sweeney Family Admin — Cloudflare Worker Backend
+ * Sweeney Family Admin — Cloudflare Worker Backend v3
  * 
  * Endpoints:
- *   POST /api/chat         — Chat with Claude → generate pages
- *   POST /api/deploy        — Push HTML to GitHub
- *   POST /api/site-map      — List files in repo
- *   GET  /api/page-source   — Fetch current page HTML from GitHub
- *   GET  /api/google/auth   — Start Google OAuth flow
+ *   POST /api/chat           — Chat with Claude → generate pages
+ *   POST /api/deploy          — Push HTML to GitHub
+ *   POST /api/site-map        — List files in repo
+ *   GET  /api/page-source     — Fetch current page HTML from GitHub
+ *   GET  /api/google/auth     — Start Google OAuth (requires ?user=chris or ?user=wife)
  *   GET  /api/google/callback — Handle OAuth callback
- *   GET  /api/calendar       — Fetch upcoming calendar events
- *   GET  /api/gmail          — Fetch recent emails
- *   GET  /api/auth-status    — Check if Google is connected
+ *   GET  /api/calendar        — Fetch merged calendar events from all connected accounts
+ *   GET  /api/gmail           — Fetch merged inbox from all connected accounts
+ *   GET  /api/connections      — List which Google accounts are connected
+ *   DELETE /api/google/disconnect — Disconnect a Google account (?user=chris)
  * 
- * Secrets (set via wrangler):
- *   ANTHROPIC_API_KEY
- *   GITHUB_TOKEN
- *   GITHUB_REPO_OWNER
- *   GITHUB_REPO_NAME
- *   GOOGLE_CLIENT_ID       — From Google Cloud Console OAuth credentials
- *   GOOGLE_CLIENT_SECRET   — From Google Cloud Console OAuth credentials
+ * Secrets:
+ *   ANTHROPIC_API_KEY, GITHUB_TOKEN, GITHUB_REPO_OWNER, GITHUB_REPO_NAME
+ *   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
  * 
- * KV Namespace (bind in wrangler.toml):
- *   TOKENS                 — Stores Google OAuth refresh tokens per user
+ * KV Namespace: TOKENS
  */
 
-// ============================================================
-// System prompt for Claude
-// ============================================================
 const SYSTEM_PROMPT = `You are the admin assistant for the Sweeney family website at family.sweeneychris.com.
 
 Your job is to help build and manage pages for this family site. You operate in two modes:
@@ -48,13 +41,6 @@ Generate a COMPLETE, self-contained HTML page (HTML + CSS + JS in one file).
 - Make it mobile-responsive
 - Include sample/placeholder data so the preview looks realistic
 
-## SITE STRUCTURE
-- / — Family Dashboard (main hub with weather, calendar, gmail)
-- /recipes — Recipe collection
-- /camp — Summer camp tracker  
-- /admin — Admin panel (don't modify)
-- /shared/edit-widget.js — Edit button script (include on every page)
-
 ## RESPONSE FORMAT
 Respond with JSON:
 {
@@ -67,17 +53,15 @@ Respond with JSON:
 }
 
 If no page is being generated, omit "page":
-{ "message": "Your response here" }
+{ "message": "Your response here" }`;
 
-Keep messages concise and friendly.`;
-
-// ============================================================
-// Google OAuth config
-// ============================================================
 const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/calendar.readonly',
   'https://www.googleapis.com/auth/gmail.readonly',
 ].join(' ');
+
+// Valid user keys for Google connections
+const VALID_USERS = ['chris', 'wife'];
 
 function getGoogleRedirectUri(request) {
   const url = new URL(request.url);
@@ -94,7 +78,7 @@ export default {
 
     const corsHeaders = {
       'Access-Control-Allow-Origin': 'https://family.sweeneychris.com',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
       'Access-Control-Allow-Credentials': 'true',
     };
@@ -104,38 +88,20 @@ export default {
     }
 
     try {
-      // Route requests
-      if (path === '/api/chat' && request.method === 'POST') {
-        return await handleChat(request, env, corsHeaders);
-      }
-      if (path === '/api/deploy' && request.method === 'POST') {
-        return await handleDeploy(request, env, corsHeaders);
-      }
-      if (path === '/api/site-map' && request.method === 'POST') {
-        return await handleSiteMap(env, corsHeaders);
-      }
-      if (path === '/api/page-source' && request.method === 'GET') {
-        return await handlePageSource(url, env, corsHeaders);
-      }
-      if (path === '/api/google/auth' && request.method === 'GET') {
-        return await handleGoogleAuth(request, url, env, corsHeaders);
-      }
-      if (path === '/api/google/callback' && request.method === 'GET') {
-        return await handleGoogleCallback(request, url, env, corsHeaders);
-      }
-      if (path === '/api/calendar' && request.method === 'GET') {
-        return await handleCalendar(request, url, env, corsHeaders);
-      }
-      if (path === '/api/gmail' && request.method === 'GET') {
-        return await handleGmail(request, url, env, corsHeaders);
-      }
-      if (path === '/api/auth-status' && request.method === 'GET') {
-        return await handleAuthStatus(request, env, corsHeaders);
-      }
+      if (path === '/api/chat' && request.method === 'POST') return await handleChat(request, env, corsHeaders);
+      if (path === '/api/deploy' && request.method === 'POST') return await handleDeploy(request, env, corsHeaders);
+      if (path === '/api/site-map' && request.method === 'POST') return await handleSiteMap(env, corsHeaders);
+      if (path === '/api/page-source' && request.method === 'GET') return await handlePageSource(url, env, corsHeaders);
+      if (path === '/api/google/auth' && request.method === 'GET') return await handleGoogleAuth(request, url, env);
+      if (path === '/api/google/callback' && request.method === 'GET') return await handleGoogleCallback(request, url, env);
+      if (path === '/api/google/disconnect' && request.method === 'DELETE') return await handleDisconnect(url, env, corsHeaders);
+      if (path === '/api/calendar' && request.method === 'GET') return await handleCalendar(url, env, corsHeaders);
+      if (path === '/api/gmail' && request.method === 'GET') return await handleGmail(url, env, corsHeaders);
+      if (path === '/api/connections' && request.method === 'GET') return await handleConnections(env, corsHeaders);
 
       return new Response('Not found', { status: 404 });
     } catch (err) {
-      return jsonResponse({ error: err.message }, 500, corsHeaders);
+      return json({ error: err.message }, 500, corsHeaders);
     }
   },
 };
@@ -143,39 +109,23 @@ export default {
 // ============================================================
 // Helpers
 // ============================================================
-function jsonResponse(data, status = 200, corsHeaders = {}) {
+function json(data, status = 200, corsHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { 'Content-Type': 'application/json', ...corsHeaders },
   });
 }
 
-// Get the user's email from Cloudflare Access JWT
-function getUserEmail(request) {
-  // Cloudflare Access sets this header with the authenticated user's JWT
-  const jwt = request.headers.get('Cf-Access-Jwt-Assertion');
-  if (!jwt) return 'default';
-  try {
-    const payload = JSON.parse(atob(jwt.split('.')[1]));
-    return payload.email || 'default';
-  } catch {
-    return 'default';
-  }
-}
+async function getGoogleAccessToken(userKey, env) {
+  const stored = await env.TOKENS.get(`google:${userKey}`, 'json');
+  if (!stored || !stored.refresh_token) return null;
 
-// Get a valid Google access token, refreshing if needed
-async function getGoogleAccessToken(userEmail, env) {
-  const stored = await env.TOKENS.get(`google:${userEmail}`, 'json');
-  if (!stored || !stored.refresh_token) {
-    return null;
-  }
-
-  // Check if access token is still valid (with 5 min buffer)
+  // Check if access token is still valid (5 min buffer)
   if (stored.access_token && stored.expires_at && Date.now() < stored.expires_at - 300000) {
     return stored.access_token;
   }
 
-  // Refresh the token
+  // Refresh
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -189,14 +139,12 @@ async function getGoogleAccessToken(userEmail, env) {
 
   const data = await res.json();
   if (data.error) {
-    // Refresh token may be revoked — clear stored tokens
-    await env.TOKENS.delete(`google:${userEmail}`);
+    await env.TOKENS.delete(`google:${userKey}`);
     return null;
   }
 
-  // Store updated tokens
-  await env.TOKENS.put(`google:${userEmail}`, JSON.stringify({
-    refresh_token: stored.refresh_token,
+  await env.TOKENS.put(`google:${userKey}`, JSON.stringify({
+    ...stored,
     access_token: data.access_token,
     expires_at: Date.now() + (data.expires_in * 1000),
   }));
@@ -205,7 +153,7 @@ async function getGoogleAccessToken(userEmail, env) {
 }
 
 // ============================================================
-// POST /api/chat — Claude API
+// POST /api/chat
 // ============================================================
 async function handleChat(request, env, corsHeaders) {
   const { message, history = [], context = null } = await request.json();
@@ -244,44 +192,35 @@ async function handleChat(request, env, corsHeaders) {
     parsed = { message: responseText };
   }
 
-  return jsonResponse(parsed, 200, corsHeaders);
+  return json(parsed, 200, corsHeaders);
 }
 
 // ============================================================
-// POST /api/deploy — Push to GitHub
+// POST /api/deploy
 // ============================================================
 async function handleDeploy(request, env, corsHeaders) {
   const { html, path, filename = 'index.html' } = await request.json();
 
   const cleanPath = path.replace(/^\//, '').replace(/\/$/, '');
-  let repoFilePath;
-  if (cleanPath === '' || cleanPath === 'dashboard') {
-    repoFilePath = 'dashboard/index.html';
-  } else {
-    repoFilePath = `dashboard/${cleanPath}/${filename}`;
-  }
+  const repoFilePath = (!cleanPath || cleanPath === 'dashboard')
+    ? 'dashboard/index.html'
+    : `dashboard/${cleanPath}/${filename}`;
 
-  const owner = env.GITHUB_REPO_OWNER;
-  const repo = env.GITHUB_REPO_NAME;
   const ghHeaders = {
     'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
     'User-Agent': 'sweeneychris-admin',
     'Accept': 'application/vnd.github.v3+json',
   };
 
-  // Check if file exists (get SHA for update)
   let existingSha = null;
   const getRes = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/contents/${repoFilePath}?ref=main`,
+    `https://api.github.com/repos/${env.GITHUB_REPO_OWNER}/${env.GITHUB_REPO_NAME}/contents/${repoFilePath}?ref=main`,
     { headers: ghHeaders }
   );
-  if (getRes.ok) {
-    existingSha = (await getRes.json()).sha;
-  }
+  if (getRes.ok) existingSha = (await getRes.json()).sha;
 
-  // Create or update
   const putRes = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/contents/${repoFilePath}`,
+    `https://api.github.com/repos/${env.GITHUB_REPO_OWNER}/${env.GITHUB_REPO_NAME}/contents/${repoFilePath}`,
     {
       method: 'PUT',
       headers: { ...ghHeaders, 'Content-Type': 'application/json' },
@@ -296,11 +235,11 @@ async function handleDeploy(request, env, corsHeaders) {
 
   if (!putRes.ok) {
     const err = await putRes.json();
-    throw new Error(`GitHub API error: ${err.message}`);
+    throw new Error(`GitHub: ${err.message}`);
   }
 
   const result = await putRes.json();
-  return jsonResponse({
+  return json({
     success: true,
     path: repoFilePath,
     commitUrl: result.commit?.html_url,
@@ -309,7 +248,7 @@ async function handleDeploy(request, env, corsHeaders) {
 }
 
 // ============================================================
-// POST /api/site-map — List repo files
+// POST /api/site-map
 // ============================================================
 async function handleSiteMap(env, corsHeaders) {
   const res = await fetch(
@@ -322,14 +261,13 @@ async function handleSiteMap(env, corsHeaders) {
       },
     }
   );
-
   const data = await res.json();
   const htmlFiles = data.tree?.filter(f => f.path.endsWith('.html')).map(f => f.path) || [];
-  return jsonResponse({ files: htmlFiles }, 200, corsHeaders);
+  return json({ files: htmlFiles }, 200, corsHeaders);
 }
 
 // ============================================================
-// GET /api/page-source — Fetch page HTML from GitHub
+// GET /api/page-source
 // ============================================================
 async function handlePageSource(url, env, corsHeaders) {
   const pagePath = url.searchParams.get('path') || '/';
@@ -347,20 +285,22 @@ async function handlePageSource(url, env, corsHeaders) {
     }
   );
 
-  if (!res.ok) {
-    return jsonResponse({ error: 'Page not found', path: filePath }, 404, corsHeaders);
-  }
+  if (!res.ok) return json({ error: 'Page not found' }, 404, corsHeaders);
 
   const data = await res.json();
   const html = decodeURIComponent(escape(atob(data.content)));
-  return jsonResponse({ html, path: pagePath, filePath, sha: data.sha }, 200, corsHeaders);
+  return json({ html, path: pagePath, filePath, sha: data.sha }, 200, corsHeaders);
 }
 
 // ============================================================
-// GET /api/google/auth — Start OAuth flow
+// GET /api/google/auth — Start OAuth (?user=chris or ?user=wife)
 // ============================================================
-async function handleGoogleAuth(request, url, env, corsHeaders) {
-  const userEmail = getUserEmail(request);
+async function handleGoogleAuth(request, url, env) {
+  const userKey = url.searchParams.get('user');
+  if (!userKey || !VALID_USERS.includes(userKey)) {
+    return new Response('Missing or invalid ?user param. Use ?user=chris or ?user=wife', { status: 400 });
+  }
+
   const redirectUri = getGoogleRedirectUri(request);
 
   const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
@@ -370,18 +310,17 @@ async function handleGoogleAuth(request, url, env, corsHeaders) {
   authUrl.searchParams.set('scope', GOOGLE_SCOPES);
   authUrl.searchParams.set('access_type', 'offline');
   authUrl.searchParams.set('prompt', 'consent');
-  // Pass the user email through state so we know who to store tokens for
-  authUrl.searchParams.set('state', userEmail);
+  authUrl.searchParams.set('state', userKey);
 
   return Response.redirect(authUrl.toString(), 302);
 }
 
 // ============================================================
-// GET /api/google/callback — Handle OAuth callback
+// GET /api/google/callback
 // ============================================================
-async function handleGoogleCallback(request, url, env, corsHeaders) {
+async function handleGoogleCallback(request, url, env) {
   const code = url.searchParams.get('code');
-  const userEmail = url.searchParams.get('state') || 'default';
+  const userKey = url.searchParams.get('state') || 'unknown';
   const error = url.searchParams.get('error');
 
   if (error) {
@@ -392,7 +331,6 @@ async function handleGoogleCallback(request, url, env, corsHeaders) {
 
   const redirectUri = getGoogleRedirectUri(request);
 
-  // Exchange code for tokens
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -413,26 +351,35 @@ async function handleGoogleCallback(request, url, env, corsHeaders) {
     });
   }
 
-  // Store tokens in KV
-  await env.TOKENS.put(`google:${userEmail}`, JSON.stringify({
+  // Get the user's email for display purposes
+  let googleEmail = '';
+  try {
+    const infoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { 'Authorization': `Bearer ${tokens.access_token}` },
+    });
+    const info = await infoRes.json();
+    googleEmail = info.email || '';
+  } catch {}
+
+  await env.TOKENS.put(`google:${userKey}`, JSON.stringify({
     refresh_token: tokens.refresh_token,
     access_token: tokens.access_token,
     expires_at: Date.now() + (tokens.expires_in * 1000),
+    email: googleEmail,
+    connected_at: new Date().toISOString(),
   }));
 
-  // Close the popup and notify the parent page
+  const displayName = userKey.charAt(0).toUpperCase() + userKey.slice(1);
+
   return new Response(`
-    <html><body>
-      <h2 style="font-family:sans-serif;text-align:center;margin-top:3rem;">
-        ✓ Google connected!
-      </h2>
-      <p style="font-family:sans-serif;text-align:center;color:#666;">
-        This window will close automatically.
-      </p>
+    <html><body style="font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#F5F0E8">
+      <div style="text-align:center">
+        <div style="font-size:3rem;margin-bottom:1rem">✓</div>
+        <h2 style="color:#2C2C2C;margin-bottom:0.5rem">${displayName}'s Google connected!</h2>
+        <p style="color:#6B6B6B">${googleEmail}<br>This window will close automatically.</p>
+      </div>
       <script>
-        if (window.opener) {
-          window.opener.postMessage({ type: 'google-auth-complete' }, '*');
-        }
+        if (window.opener) window.opener.postMessage({ type: 'google-auth-complete', user: '${userKey}' }, '*');
         setTimeout(() => window.close(), 2000);
       </script>
     </body></html>
@@ -440,127 +387,176 @@ async function handleGoogleCallback(request, url, env, corsHeaders) {
 }
 
 // ============================================================
-// GET /api/auth-status — Check Google connection status
+// GET /api/connections — Which accounts are connected?
 // ============================================================
-async function handleAuthStatus(request, env, corsHeaders) {
-  const userEmail = getUserEmail(request);
-  const token = await getGoogleAccessToken(userEmail, env);
-  return jsonResponse({
-    google_connected: !!token,
-    user: userEmail,
+async function handleConnections(env, corsHeaders) {
+  const connections = {};
+
+  for (const userKey of VALID_USERS) {
+    const stored = await env.TOKENS.get(`google:${userKey}`, 'json');
+    connections[userKey] = stored ? {
+      connected: true,
+      email: stored.email || 'Unknown',
+      connected_at: stored.connected_at || null,
+    } : { connected: false };
+  }
+
+  return json({ connections }, 200, corsHeaders);
+}
+
+// ============================================================
+// DELETE /api/google/disconnect?user=chris
+// ============================================================
+async function handleDisconnect(url, env, corsHeaders) {
+  const userKey = url.searchParams.get('user');
+  if (!userKey || !VALID_USERS.includes(userKey)) {
+    return json({ error: 'Invalid user' }, 400, corsHeaders);
+  }
+
+  await env.TOKENS.delete(`google:${userKey}`);
+  return json({ success: true, message: `${userKey} disconnected` }, 200, corsHeaders);
+}
+
+// ============================================================
+// GET /api/calendar — Merged calendar from all connected accounts
+// ============================================================
+async function handleCalendar(url, env, corsHeaders) {
+  const maxResults = url.searchParams.get('max') || '10';
+  const now = new Date().toISOString();
+  const twoWeeksOut = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
+
+  const allEvents = [];
+
+  for (const userKey of VALID_USERS) {
+    const accessToken = await getGoogleAccessToken(userKey, env);
+    if (!accessToken) continue;
+
+    try {
+      const calRes = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
+        `timeMin=${encodeURIComponent(now)}&` +
+        `timeMax=${encodeURIComponent(twoWeeksOut)}&` +
+        `maxResults=${maxResults}&` +
+        `singleEvents=true&` +
+        `orderBy=startTime`,
+        { headers: { 'Authorization': `Bearer ${accessToken}` } }
+      );
+
+      if (!calRes.ok) continue;
+
+      const calData = await calRes.json();
+      const stored = await env.TOKENS.get(`google:${userKey}`, 'json');
+      const ownerEmail = stored?.email || userKey;
+
+      const events = (calData.items || []).map(e => ({
+        id: e.id,
+        title: e.summary || '(No title)',
+        start: e.start?.dateTime || e.start?.date,
+        end: e.end?.dateTime || e.end?.date,
+        allDay: !!e.start?.date,
+        location: e.location || null,
+        description: e.description ? e.description.substring(0, 200) : null,
+        link: e.htmlLink,
+        owner: userKey,
+        ownerEmail,
+      }));
+
+      allEvents.push(...events);
+    } catch (err) {
+      // Skip this user's calendar on error
+    }
+  }
+
+  // Sort all events by start time
+  allEvents.sort((a, b) => new Date(a.start) - new Date(b.start));
+
+  // Check connection status
+  const connectedUsers = [];
+  for (const userKey of VALID_USERS) {
+    const stored = await env.TOKENS.get(`google:${userKey}`, 'json');
+    if (stored) connectedUsers.push(userKey);
+  }
+
+  return json({
+    events: allEvents,
+    connected_users: connectedUsers,
+    any_connected: connectedUsers.length > 0,
   }, 200, corsHeaders);
 }
 
 // ============================================================
-// GET /api/calendar — Fetch upcoming events
+// GET /api/gmail — Merged inbox from all connected accounts
 // ============================================================
-async function handleCalendar(request, url, env, corsHeaders) {
-  const userEmail = getUserEmail(request);
-  const accessToken = await getGoogleAccessToken(userEmail, env);
+async function handleGmail(url, env, corsHeaders) {
+  const maxPerUser = parseInt(url.searchParams.get('max') || '5');
+  const allMessages = [];
 
-  if (!accessToken) {
-    return jsonResponse({
-      connected: false,
-      message: 'Google Calendar not connected. Visit /api/google/auth to connect.',
-    }, 200, corsHeaders);
-  }
+  for (const userKey of VALID_USERS) {
+    const accessToken = await getGoogleAccessToken(userKey, env);
+    if (!accessToken) continue;
 
-  const maxResults = url.searchParams.get('max') || '10';
-  const now = new Date().toISOString();
-  const weekFromNow = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
-
-  const calRes = await fetch(
-    `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
-    `timeMin=${encodeURIComponent(now)}&` +
-    `timeMax=${encodeURIComponent(weekFromNow)}&` +
-    `maxResults=${maxResults}&` +
-    `singleEvents=true&` +
-    `orderBy=startTime`,
-    {
-      headers: { 'Authorization': `Bearer ${accessToken}` },
-    }
-  );
-
-  if (!calRes.ok) {
-    const err = await calRes.json();
-    return jsonResponse({ connected: true, error: err.error?.message || 'Calendar API error' }, 200, corsHeaders);
-  }
-
-  const calData = await calRes.json();
-  const events = (calData.items || []).map(e => ({
-    id: e.id,
-    title: e.summary || '(No title)',
-    start: e.start?.dateTime || e.start?.date,
-    end: e.end?.dateTime || e.end?.date,
-    allDay: !!e.start?.date,
-    location: e.location || null,
-    description: e.description ? e.description.substring(0, 200) : null,
-    link: e.htmlLink,
-  }));
-
-  return jsonResponse({ connected: true, events }, 200, corsHeaders);
-}
-
-// ============================================================
-// GET /api/gmail — Fetch recent emails
-// ============================================================
-async function handleGmail(request, url, env, corsHeaders) {
-  const userEmail = getUserEmail(request);
-  const accessToken = await getGoogleAccessToken(userEmail, env);
-
-  if (!accessToken) {
-    return jsonResponse({
-      connected: false,
-      message: 'Gmail not connected. Visit /api/google/auth to connect.',
-    }, 200, corsHeaders);
-  }
-
-  const maxResults = url.searchParams.get('max') || '8';
-
-  // Fetch message list
-  const listRes = await fetch(
-    `https://www.googleapis.com/gmail/v1/users/me/messages?maxResults=${maxResults}&labelIds=INBOX`,
-    { headers: { 'Authorization': `Bearer ${accessToken}` } }
-  );
-
-  if (!listRes.ok) {
-    const err = await listRes.json();
-    return jsonResponse({ connected: true, error: err.error?.message || 'Gmail API error' }, 200, corsHeaders);
-  }
-
-  const listData = await listRes.json();
-  const messageIds = (listData.messages || []).map(m => m.id);
-
-  // Fetch details for each message (metadata only — no body content)
-  const messages = await Promise.all(
-    messageIds.map(async (id) => {
-      const msgRes = await fetch(
-        `https://www.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`,
+    try {
+      const listRes = await fetch(
+        `https://www.googleapis.com/gmail/v1/users/me/messages?maxResults=${maxPerUser}&labelIds=INBOX`,
         { headers: { 'Authorization': `Bearer ${accessToken}` } }
       );
-      if (!msgRes.ok) return null;
-      const msg = await msgRes.json();
 
-      const headers = {};
-      (msg.payload?.headers || []).forEach(h => {
-        headers[h.name.toLowerCase()] = h.value;
-      });
+      if (!listRes.ok) continue;
 
-      return {
-        id: msg.id,
-        threadId: msg.threadId,
-        from: headers.from || 'Unknown',
-        subject: headers.subject || '(No subject)',
-        date: headers.date || null,
-        snippet: msg.snippet || '',
-        unread: (msg.labelIds || []).includes('UNREAD'),
-        link: `https://mail.google.com/mail/u/0/#inbox/${msg.id}`,
-      };
-    })
-  );
+      const listData = await listRes.json();
+      const messageIds = (listData.messages || []).map(m => m.id);
 
-  return jsonResponse({
-    connected: true,
-    messages: messages.filter(Boolean),
+      const stored = await env.TOKENS.get(`google:${userKey}`, 'json');
+      const ownerEmail = stored?.email || userKey;
+
+      const messages = await Promise.all(
+        messageIds.map(async (id) => {
+          const msgRes = await fetch(
+            `https://www.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`,
+            { headers: { 'Authorization': `Bearer ${accessToken}` } }
+          );
+          if (!msgRes.ok) return null;
+          const msg = await msgRes.json();
+
+          const headers = {};
+          (msg.payload?.headers || []).forEach(h => {
+            headers[h.name.toLowerCase()] = h.value;
+          });
+
+          return {
+            id: msg.id,
+            threadId: msg.threadId,
+            from: headers.from || 'Unknown',
+            subject: headers.subject || '(No subject)',
+            date: headers.date || null,
+            timestamp: msg.internalDate ? parseInt(msg.internalDate) : 0,
+            snippet: msg.snippet || '',
+            unread: (msg.labelIds || []).includes('UNREAD'),
+            link: `https://mail.google.com/mail/u/0/#inbox/${msg.id}`,
+            owner: userKey,
+            ownerEmail,
+          };
+        })
+      );
+
+      allMessages.push(...messages.filter(Boolean));
+    } catch (err) {
+      // Skip this user on error
+    }
+  }
+
+  // Sort by date (newest first)
+  allMessages.sort((a, b) => b.timestamp - a.timestamp);
+
+  const connectedUsers = [];
+  for (const userKey of VALID_USERS) {
+    const stored = await env.TOKENS.get(`google:${userKey}`, 'json');
+    if (stored) connectedUsers.push(userKey);
+  }
+
+  return json({
+    messages: allMessages,
+    connected_users: connectedUsers,
+    any_connected: connectedUsers.length > 0,
   }, 200, corsHeaders);
 }
